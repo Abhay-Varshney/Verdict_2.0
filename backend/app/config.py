@@ -20,9 +20,16 @@ class Settings(BaseSettings):
     # LLM
     llm_provider: str = "mock"  # anthropic | openai | mock
     llm_model: str = "claude-sonnet-4-20250514"
+    llm_base_url: str = "https://openrouter.ai/api/v1"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
+    
+    # STT
+    groq_api_key: str = ""
+    stt_model: str = "whisper-large-v3"
+    max_audio_mb: int = 25
+    
     # Uploads
     upload_dir: str = "./uploads"
     max_upload_mb: int = 15

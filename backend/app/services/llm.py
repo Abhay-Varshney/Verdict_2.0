@@ -1,13 +1,14 @@
 """Provider-agnostic LLM service.
 
-Supports Anthropic and OpenAI over raw HTTP (no hard SDK dependency), plus a
-fully offline **mock** provider so the app runs end-to-end with no API key.
-The public functions always return validated Python dicts shaped like the
-structured schemas in ``prompts.py``.
+Supports Anthropic and OpenAI-compatible APIs (OpenAI, OpenRouter, Fireworks)
+over raw HTTP (no hard SDK dependency), plus a fully offline **mock** provider
+so the app runs end-to-end with no API key. The public functions always return
+validated Python dicts shaped like the structured schemas in ``prompts.py``.
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -20,6 +21,27 @@ from .prompts import (
     build_doc_analysis_prompt,
     build_system_prompt,
     build_user_prompt,
+)
+
+try:  # optional: repairs truncated / slightly broken JSON
+    import json_repair  # type: ignore
+except ImportError:  # pragma: no cover
+    json_repair = None
+
+log = logging.getLogger("verdict.llm")
+
+# Long PDFs make the model run out of output tokens -> broken JSON.
+# Only the first part of the document is sent for analysis.
+MAX_DOC_CHARS = 30000
+DOC_MAX_TOKENS = 8000
+EXPLAIN_MAX_TOKENS = 8000
+HTTP_TIMEOUT = 180
+
+JSON_ONLY_SUFFIX = (
+    "\n\nIMPORTANT OUTPUT RULES:\n"
+    "- Respond with ONE valid JSON object only. No markdown, no code fences, no extra text.\n"
+    "- Keep every text field short (1-3 sentences).\n"
+    "- Include at most 12 clauses, choosing the most important ones.\n"
 )
 
 
@@ -41,7 +63,7 @@ async def _call_anthropic(system: str, user: str, max_tokens: int) -> str:
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.post(url, headers=headers, json=body)
         if r.status_code >= 400:
             raise LLMError(f"Anthropic API error {r.status_code}: {r.text[:300]}")
@@ -54,12 +76,15 @@ async def _call_anthropic(system: str, user: str, max_tokens: int) -> str:
 
 
 async def _call_openai(system: str, user: str, max_tokens: int) -> str:
-    url = "https://api.openai.com/v1/chat/completions"
+    url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
     headers = {
         "Authorization": f"Bearer {settings.openai_api_key}",
         "Content-Type": "application/json",
+        # Optional OpenRouter attribution headers (ignored by other providers)
+        "HTTP-Referer": "http://localhost:5173",
+        "X-Title": "Verdict",
     }
-    body = {
+    body: dict[str, Any] = {
         "model": settings.llm_model,
         "max_tokens": max_tokens,
         "messages": [
@@ -68,12 +93,29 @@ async def _call_openai(system: str, user: str, max_tokens: int) -> str:
         ],
         "response_format": {"type": "json_object"},
     }
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.post(url, headers=headers, json=body)
+
+        # Some models don't support JSON mode -> retry once without it
+        if r.status_code == 400 and "response_format" in r.text:
+            body.pop("response_format", None)
+            r = await client.post(url, headers=headers, json=body)
+
         if r.status_code >= 400:
-            raise LLMError(f"OpenAI API error {r.status_code}: {r.text[:300]}")
+            raise LLMError(f"LLM API error {r.status_code}: {r.text[:300]}")
+
         data = r.json()
-        return data["choices"][0]["message"]["content"]
+        if not data.get("choices"):
+            raise LLMError(f"LLM returned no choices: {str(data)[:300]}")
+
+        choice = data["choices"][0]
+        content = (choice.get("message") or {}).get("content") or ""
+        finish = choice.get("finish_reason")
+        if not content.strip():
+            raise LLMError(f"Model returned an empty answer (finish_reason={finish})")
+        if finish == "length":
+            log.warning("LLM output hit max_tokens; JSON may be truncated (will try to repair)")
+        return content
 
 
 async def _call_llm(system: str, user: str, max_tokens: int = 2000) -> str:
@@ -85,21 +127,45 @@ async def _call_llm(system: str, user: str, max_tokens: int = 2000) -> str:
     raise LLMError("No live provider configured")
 
 
-def _extract_json(text: str) -> dict[str, Any]:
+def _extract_json(text: str | None) -> dict[str, Any]:
     """Best-effort extraction of a JSON object from model output."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text).strip()
+    if not text or not text.strip():
+        raise LLMError("Model returned an empty answer")
+
+    # Remove reasoning blocks and markdown fences
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    # 1) Plain parse
     try:
-        return json.loads(text)
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
     except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                pass
+        pass
+
+    # 2) Parse the {...} block only
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # 3) Repair truncated / broken JSON
+    if json_repair is not None and start != -1:
+        try:
+            data = json_repair.loads(text[start:])
+            if isinstance(data, dict) and data:
+                log.warning("LLM JSON was broken; repaired automatically")
+                return data
+        except Exception:  # noqa: BLE001
+            pass
+
+    log.error("Invalid JSON from model. First 1500 chars:\n%s", text[:1500])
     raise LLMError("Model did not return valid JSON")
 
 
@@ -116,8 +182,10 @@ async def generate_explanation(
         return _mock_explanation(question, jurisdiction, mode, persona, topic)
 
     system = build_system_prompt(jurisdiction)
-    user = build_user_prompt(question, mode, persona, topic, document_excerpt)
-    raw = await _call_llm(system, user, max_tokens=2200)
+    user = build_user_prompt(
+        question, mode, persona, topic, (document_excerpt or "")[:MAX_DOC_CHARS]
+    )
+    raw = await _call_llm(system, user, max_tokens=EXPLAIN_MAX_TOKENS)
     data = _extract_json(raw)
     return _normalize_explanation(data)
 
@@ -125,14 +193,22 @@ async def generate_explanation(
 async def analyze_document(
     filename: str, text: str, jurisdiction: str
 ) -> dict[str, Any]:
-    if not text.strip():
+    if not text or not text.strip():
         raise LLMError("No extractable text in document")
     if settings.effective_provider == "mock":
         return _mock_analysis(filename, text)
 
-    user = build_doc_analysis_prompt(filename, text, jurisdiction)
-    raw = await _call_llm(DOC_ANALYSIS_SYSTEM, user, max_tokens=3000)
-    return _normalize_analysis(_extract_json(raw))
+    truncated = len(text) > MAX_DOC_CHARS
+    doc_text = text[:MAX_DOC_CHARS]
+    if truncated:
+        doc_text += "\n\n[Document truncated for analysis — only the first part is included.]"
+
+    user = build_doc_analysis_prompt(filename, doc_text, jurisdiction) + JSON_ONLY_SUFFIX
+    raw = await _call_llm(DOC_ANALYSIS_SYSTEM, user, max_tokens=DOC_MAX_TOKENS)
+    result = _normalize_analysis(_extract_json(raw))
+    if truncated and result.get("summary"):
+        result["summary"] += " (Note: only the first part of this long document was analyzed.)"
+    return result
 
 
 # ── Normalizers (guarantee the frontend contract) ───────────────────────
@@ -156,31 +232,41 @@ _EXPLAIN_DEFAULTS = {
 
 def _normalize_explanation(data: dict) -> dict:
     out = {**_EXPLAIN_DEFAULTS, **{k: v for k, v in data.items() if k in _EXPLAIN_DEFAULTS}}
-    if not isinstance(out["citations"], list):
-        out["citations"] = []
-    if not isinstance(out["important_dates"], list):
-        out["important_dates"] = []
+    for key, default in _EXPLAIN_DEFAULTS.items():
+        if isinstance(default, list) and not isinstance(out[key], list):
+            out[key] = []
     return out
 
 
+_ANALYSIS_DEFAULTS = {
+    "summary": "",
+    "document_type": "Document",
+    "parties": [],
+    "overall_risk": 0,
+    "risk_categories": {},
+    "clauses": [],
+    "important_dates": [],
+    "obligations": [],
+    "penalties": [],
+    "definitions": [],
+    "problematic_provisions": [],
+    "confidence": "medium",
+}
+
+
 def _normalize_analysis(data: dict) -> dict:
-    defaults = {
-        "summary": "",
-        "document_type": "Document",
-        "parties": [],
-        "overall_risk": 0,
-        "risk_categories": {},
-        "clauses": [],
-        "important_dates": [],
-        "obligations": [],
-        "penalties": [],
-        "definitions": [],
-        "problematic_provisions": [],
-        "confidence": "medium",
-    }
-    out = {**defaults, **{k: v for k, v in data.items() if k in defaults}}
+    out = {**_ANALYSIS_DEFAULTS, **{k: v for k, v in data.items() if k in _ANALYSIS_DEFAULTS}}
+
+    # Type safety so a half-repaired JSON can't crash the frontend
+    for key, default in _ANALYSIS_DEFAULTS.items():
+        if isinstance(default, list) and not isinstance(out[key], list):
+            out[key] = []
+        if isinstance(default, dict) and not isinstance(out[key], dict):
+            out[key] = {}
+    out["clauses"] = [c for c in out["clauses"] if isinstance(c, dict)]
+
     try:
-        out["overall_risk"] = max(0, min(10, int(out["overall_risk"])))
+        out["overall_risk"] = max(0, min(10, int(float(out["overall_risk"]))))
     except (TypeError, ValueError):
         out["overall_risk"] = 0
     return out

@@ -28,7 +28,7 @@ def extract_text(filename: str, content: bytes, content_type: str = "") -> str:
 
 def _extract_pdf(content: bytes) -> str:
     from pypdf import PdfReader
-
+    print("PDF BYTES RECEIVED:", len(content))
     reader = PdfReader(io.BytesIO(content))
     pages = [page.extract_text() or "" for page in reader.pages]
     text = "\n\n".join(pages).strip()

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { api, streamExplain, type ExplainRequest } from "../api/client";
+import { api, streamExplain, transcribeAudio, type ExplainRequest } from "../api/client";
 import { useAuth } from "../store/auth";
 import { useToast } from "../store/toast";
+import { useVoiceInput } from "../hooks/useVoiceInput";
 import type { DocumentItem, Message, ReferenceMeta } from "../lib/types";
 import { StructuredAnswer } from "../components/StructuredAnswer";
 import { DisclaimerBanner, MockModeNotice, PageHeader } from "../components/ui";
@@ -14,6 +15,25 @@ const SAMPLE_QUESTIONS = [
   "I was terminated without notice — what are my options?",
   "Is my employer allowed to withhold my final salary?",
 ];
+
+function MicIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9" y="2" width="6" height="12" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0" />
+      <path d="M12 18v4" />
+    </svg>
+  );
+}
+
+function StopIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  );
+}
 
 export default function Explainer() {
   const { user } = useAuth();
@@ -37,6 +57,13 @@ export default function Explainer() {
   const [status, setStatus] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Voice input: transcript is appended to the text box so the user can edit before sending.
+  const voice = useVoiceInput({
+    onText: (text) => setQuestion((prev) => (prev.trim() ? prev.trimEnd() + " " : "") + text),
+    onError: (message) => push(message, "error"),
+    transcribe: transcribeAudio,
+  });
 
   useEffect(() => {
     api.meta().then(setMeta).catch(() => {});
@@ -182,7 +209,7 @@ export default function Explainer() {
           </div>
           <h3 className="font-semibold text-ink">Ask your first question</h3>
           <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-            Describe your situation in your own words. You can ask follow-up questions after.
+            Describe your situation in your own words, or tap the mic and speak. You can ask follow-up questions after.
           </p>
           <div className="mx-auto mt-4 flex max-w-lg flex-wrap justify-center gap-2">
             {SAMPLE_QUESTIONS.map((sq) => (
@@ -226,7 +253,15 @@ export default function Explainer() {
         <div className="card flex items-end gap-2 p-2">
           <textarea
             className="input max-h-40 min-h-[46px] resize-none border-0 focus:ring-0"
-            placeholder={started ? "Ask a follow-up question…" : "Describe your legal or policy question…"}
+            placeholder={
+              voice.recording
+                ? "Listening… tap stop when you're done"
+                : voice.transcribing
+                  ? "Transcribing your voice…"
+                  : started
+                    ? "Ask a follow-up question…"
+                    : "Describe your legal or policy question…"
+            }
             value={question}
             rows={1}
             onChange={(e) => setQuestion(e.target.value)}
@@ -238,7 +273,31 @@ export default function Explainer() {
             }}
             aria-label="Your question"
           />
-          <button type="submit" className="btn-primary shrink-0" disabled={busy || question.trim().length < 3}>
+          <button
+            type="button"
+            onClick={voice.toggle}
+            disabled={busy || voice.transcribing}
+            aria-label={voice.recording ? "Stop recording" : "Speak your question"}
+            title={voice.recording ? "Stop recording" : "Speak your question"}
+            className={`grid h-[46px] w-[46px] shrink-0 place-items-center rounded-lg transition ${
+              voice.recording
+                ? "animate-pulse bg-red-100 text-red-600"
+                : "text-slate-500 hover:bg-slate-100 disabled:opacity-50"
+            }`}
+          >
+            {voice.transcribing ? (
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-brand-200 border-t-brand-600" />
+            ) : voice.recording ? (
+              <StopIcon />
+            ) : (
+              <MicIcon />
+            )}
+          </button>
+          <button
+            type="submit"
+            className="btn-primary shrink-0"
+            disabled={busy || voice.recording || voice.transcribing || question.trim().length < 3}
+          >
             {busy ? "Analyzing…" : "Explain"}
             {!busy && <ArrowRight width={16} height={16} />}
           </button>

@@ -63,10 +63,26 @@ async function upload<T>(path: string, form: FormData): Promise<T> {
   const headers: Record<string, string> = {};
   const token = getToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${BASE}${path}`, { method: "POST", body: form, headers });
+
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, { method: "POST", body: form, headers });
+  } catch {
+    throw new ApiError(0, "Network error — please check your connection and try again.");
+  }
+
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new ApiError(res.status, (body && body.detail) || "Upload failed.");
+    const detail = body && (body.detail || body.message);
+    const message =
+      typeof detail === "string"
+        ? detail
+        : detail && typeof detail === "object" && typeof detail.message === "string"
+          ? detail.message
+          : res.status === 401
+            ? "Your session has expired. Please sign in again."
+            : "Upload failed.";
+    throw new ApiError(res.status, message);
   }
   return body as T;
 }
@@ -170,6 +186,14 @@ export const api = {
       }`,
     ),
 };
+
+/** Send recorded audio (WAV) to the backend and get the transcript text back. */
+export async function transcribeAudio(wav: Blob): Promise<string> {
+  const form = new FormData();
+  form.append("file", wav, "voice.wav");
+  const res = await upload<{ text: string }>("/api/transcribe", form);
+  return res.text;
+}
 
 /**
  * Stream an explanation via SSE. Consumes the POST response body with fetch so

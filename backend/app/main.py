@@ -14,6 +14,7 @@ from .routers import (
     explain,
     feedback,
     search,
+    transcribe,
 )
 from .seed import init_db, seed_demo_user
 
@@ -87,5 +88,5 @@ def disclaimer():
     }
 
 
-for r in (auth, explain, conversations, documents, bookmarks, feedback, search):
+for r in (auth, explain, conversations, documents, bookmarks, feedback, search, transcribe):
     app.include_router(r.router)
